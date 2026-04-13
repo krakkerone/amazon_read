@@ -1,89 +1,264 @@
-Preparazione step by step
+# find_ses_account.py
 
-  1. Python
+Trova quale account AWS ha inviato un'email tramite SES, dato il Message-ID.
 
-  Verifica di avere Python 3.7+:
-  python --version
-  Se non ce l'hai: scaricalo da python.org oppure winget install Python.Python.3
+Lo script cerca in CloudTrail di ogni account dell'organizzazione il match
+sul `responseElements.messageId` degli eventi SendEmail.
 
-  2. Installa dipendenze
+**Lo script e' 100% di sola lettura. Non crea, modifica o cancella nulla in AWS.**
 
-  cd "C:\Users\jodya\OneDrive\Documents\_CODE\_Projects\amazon_read"
-  pip install -r requirements.txt
+---
 
-  Oppure semplicemente:
-  pip install boto3
+## Dove trovare il Message-ID
 
-  3. AWS CLI (se non ce l'hai)
+Il Message-ID si trova negli header dell'email ricevuta:
 
-  winget install Amazon.AWSCLI
+| Client | Come fare |
+|--------|-----------|
+| Gmail | Apri email > 3 puntini > "Mostra originale" |
+| Outlook | Apri email > File > Proprieta > "Intestazioni Internet" |
+| Thunderbird | Visualizza > Sorgente del messaggio (Ctrl+U) |
+| Apple Mail | Visualizza > Messaggio > Sorgente completa |
 
-  Poi verifica:
-  aws --version
+Cerca la riga:
+```
+Message-ID: <0100018f1a2b3c4d-xxxxx@eu-west-1.amazonses.com>
+```
 
-  4. Configura le credenziali del master account
+La parte dopo `@` e' la regione SES (es: `eu-west-1`).
 
-  Hai bisogno delle credenziali di un utente IAM (o ruolo) nel management account dell'organizzazione.
+---
 
-  aws configure --profile master
+## Prerequisiti
 
-  Ti chiederà:
-  AWS Access Key ID:      AKIA...........
-  AWS Secret Access Key:  wJal...........
-  Default region:         eu-west-1
-  Default output format:  json
+### 1. Python 3.7+
 
-  5. Verifica che funzioni
+```bash
+python --version
+```
 
-  aws sts get-caller-identity --profile master
+Se non c'e': scaricalo da python.org oppure `winget install Python.Python.3`
 
-  Deve restituire qualcosa tipo:
-  {
-      "UserId": "AIDA...",
-      "Account": "000000000000",    <-- questo deve essere il master account
-      "Arn": "arn:aws:iam::000000000000:user/tuonome"
-  }
+### 2. Installa dipendenze
 
-  6. Verifica i permessi
+```bash
+pip install -r requirements.txt
+```
 
-  L'utente/ruolo che usi deve avere queste permission:
+### 3. AWS CLI
 
-  sts:GetCallerIdentity          (ce l'hanno tutti di default)
-  organizations:ListAccounts     (per listare gli account dell'org)
-  sts:AssumeRole                 (per entrare negli account membri)
+```bash
+winget install Amazon.AWSCLI
+aws --version
+```
 
-  E il ruolo target negli account membri (OrganizationAccountAccessRole di default) deve avere:
+### 4. Configura credenziali del master account
 
-  cloudtrail:LookupEvents        (per cercare gli eventi)
+Con SSO:
+```bash
+aws configure sso
+```
 
-  OrganizationAccountAccessRole ha AdministratorAccess, quindi ha tutto. Se usate un ruolo custom verifica che abbia
-  almeno cloudtrail:LookupEvents.
+Con Access Key:
+```bash
+aws configure --profile master
+```
 
-  7. Lancia
+### 5. Verifica che funzioni
 
-  python find_ses_account.py "IL-TUO-MESSAGE-ID@eu-west-1.amazonses.com" --profile master
+```bash
+aws sts get-caller-identity --profile TUO_PROFILO
+```
 
-  ---
-  Checklist rapida
+Deve restituire l'Account ID del master account.
 
-  ┌───────────────────────┬──────────────────────────────────────────────────┬──────────────────────────────────────┐
-  │         Step          │                     Comando                      │                 OK?                  │
-  ├───────────────────────┼──────────────────────────────────────────────────┼──────────────────────────────────────┤
-  │ Python installato     │ python --version                                 │ 3.7+                                 │
-  ├───────────────────────┼──────────────────────────────────────────────────┼──────────────────────────────────────┤
-  │ boto3 installato      │ pip install boto3                                │                                      │
-  ├───────────────────────┼──────────────────────────────────────────────────┼──────────────────────────────────────┤
-  │ AWS CLI installato    │ aws --version                                    │                                      │
-  ├───────────────────────┼──────────────────────────────────────────────────┼──────────────────────────────────────┤
-  │ Credenziali           │ aws configure --profile master                   │                                      │
-  │ configurate           │                                                  │                                      │
-  ├───────────────────────┼──────────────────────────────────────────────────┼──────────────────────────────────────┤
-  │ Sei nel master        │ aws sts get-caller-identity --profile master     │                                      │
-  │ account               │                                                  │                                      │
-  ├───────────────────────┼──────────────────────────────────────────────────┼──────────────────────────────────────┤
-  │ Hai il Message-ID     │ dagli header dell'email                          │ deve finire con                      │
-  │                       │                                                  │ @regione.amazonses.com               │
-  ├───────────────────────┼──────────────────────────────────────────────────┼──────────────────────────────────────┤
-  │ Lancia                │ python find_ses_account.py "MSG-ID" --profile    │                                      │
-  │                       │ master                                           │                                      │
-  └───────────────────────┴──────────────────────────────────────────────────┴──────────────────────────────────────┘
+---
+
+## Setup del ruolo cross-account (StackSet)
+
+Lo script ha bisogno di un ruolo in ogni account membro per accedere a CloudTrail.
+Se l'organizzazione ha gia' `OrganizationAccountAccessRole`, salta questa sezione.
+Altrimenti (es: usi SSO e non hai ruoli cross-account), segui questa procedura
+per creare un ruolo temporaneo read-only in tutti gli account.
+
+### Step 1 - Trova il tuo Master Account ID
+
+```bash
+aws sts get-caller-identity --profile TUO_PROFILO --query 'Account' --output text
+```
+
+Copia il numero di 12 cifre.
+
+### Step 2 - Attiva trusted access per CloudFormation StackSets
+
+Dalla console AWS:
+1. Vai su **CloudFormation** > **StackSets**
+2. Se vedi un banner "Enable trusted access" > cliccalo
+3. Se non c'e' nessun banner, e' gia' attivo
+
+### Step 3 - Crea lo StackSet
+
+```bash
+aws cloudformation create-stack-set \
+  --stack-set-name SESFinderRole \
+  --template-body file://ses-finder-role.yaml \
+  --parameters ParameterKey=MasterAccountId,ParameterValue=IL_TUO_MASTER_ACCOUNT_ID \
+  --permission-model SERVICE_MANAGED \
+  --auto-deployment Enabled=false \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --profile TUO_PROFILO
+```
+
+Sostituisci `IL_TUO_MASTER_ACCOUNT_ID` con il numero dello Step 1.
+
+### Step 4 - Deploya in tutti gli account
+
+Trova l'ID della root OU:
+
+```bash
+aws organizations list-roots --profile TUO_PROFILO --query 'Roots[0].Id' --output text
+```
+
+Copia l'ID (formato `r-xxxx`). Poi deploya:
+
+```bash
+aws cloudformation create-stack-instances \
+  --stack-set-name SESFinderRole \
+  --deployment-targets OrganizationalUnitIds='["r-XXXX"]' \
+  --regions '["eu-west-1"]' \
+  --profile TUO_PROFILO
+```
+
+Sostituisci `r-XXXX` con il tuo root ID.
+
+### Step 5 - Verifica che il deploy sia completato (~2-5 minuti)
+
+```bash
+aws cloudformation list-stack-set-operations \
+  --stack-set-name SESFinderRole \
+  --profile TUO_PROFILO \
+  --query 'Summaries[0].Status'
+```
+
+Quando dice `SUCCEEDED`, vai avanti.
+
+---
+
+## Lancia lo script
+
+Se hai creato il ruolo con lo StackSet:
+
+```bash
+python find_ses_account.py "MSG-ID@eu-west-1.amazonses.com" --profile TUO_PROFILO --role-name SESFinderReadOnly
+```
+
+Se usi `OrganizationAccountAccessRole` (default):
+
+```bash
+python find_ses_account.py "MSG-ID@eu-west-1.amazonses.com" --profile TUO_PROFILO
+```
+
+### Parametri
+
+| Parametro | Descrizione | Default |
+|-----------|-------------|---------|
+| `message_id` | Message-ID dell'email (obbligatorio) | - |
+| `--profile`, `-p` | AWS CLI profile | default |
+| `--role-name`, `-r` | Nome del ruolo cross-account | OrganizationAccountAccessRole |
+| `--days`, `-d` | Giorni indietro in CloudTrail | 14 (max 90) |
+| `--threads`, `-t` | Thread paralleli | 10 |
+| `--account-ids` | Solo questi account (virgola-separati) | tutti |
+
+### Output atteso
+
+```
+  SES Message-ID: 0100018f-xxxx
+  Regione:        eu-west-1
+  Master Account: 000000000000
+  Account da cercare: 15
+  Ultimi 14 giorni
+
+  Ricerca in corso...
+
+  [ ] Account-Dev (111111111111)
+  [ ] Account-Staging (222222222222)
+  [*] Account-Prod (333333333333) - *** TROVATO ***
+
+======================================================================
+  TROVATO!
+======================================================================
+  Account ID:    333333333333
+  Account Name:  Account-Prod
+  Regione:       eu-west-1
+  Evento:        SendEmail
+  From:          noreply@example.com
+  To:            destinatario@gmail.com
+  Subject:       Conferma ordine #12345
+  Caller ARN:    arn:aws:iam::333333333333:role/MyAppRole
+======================================================================
+```
+
+### Troubleshooting
+
+| Problema | Soluzione |
+|----------|-----------|
+| "NON TROVATO" | Prova `--days 90` per cercare piu' indietro |
+| "skip (no role access)" su tutti | Il ruolo non esiste. Segui la sezione StackSet sopra |
+| "skip (no role access)" su alcuni | Normale per account invitati. Se gli altri funzionano, ok |
+| "security token not valid" | Token SSO scaduto. Rinnova con `aws sso login --profile TUO_PROFILO` |
+| "Regione non trovata" | Il Message-ID deve contenere `@regione.amazonses.com` |
+
+---
+
+## Pulizia: rimuovi il ruolo da tutti gli account
+
+Dopo aver trovato l'account, rimuovi tutto.
+
+### Step 1 - Cancella le istanze (rimuove il ruolo da tutti gli account)
+
+```bash
+aws cloudformation delete-stack-instances \
+  --stack-set-name SESFinderRole \
+  --deployment-targets OrganizationalUnitIds='["r-XXXX"]' \
+  --regions '["eu-west-1"]' \
+  --no-retain-stacks \
+  --profile TUO_PROFILO
+```
+
+Sostituisci `r-XXXX` con lo stesso root ID usato nel deploy.
+
+### Step 2 - Attendi completamento (~2-5 minuti)
+
+```bash
+aws cloudformation list-stack-set-operations \
+  --stack-set-name SESFinderRole \
+  --profile TUO_PROFILO \
+  --query 'Summaries[0].Status'
+```
+
+Quando dice `SUCCEEDED`, prosegui.
+
+### Step 3 - Cancella lo StackSet
+
+```bash
+aws cloudformation delete-stack-set \
+  --stack-set-name SESFinderRole \
+  --profile TUO_PROFILO
+```
+
+Fatto. Il ruolo `SESFinderReadOnly` e' stato rimosso da tutti gli account
+e lo StackSet e' stato eliminato. Non resta nulla.
+
+---
+
+## Riepilogo processo completo
+
+| # | Cosa | Comando | Tempo |
+|---|------|---------|-------|
+| 1 | Trova master account ID | `aws sts get-caller-identity` | 10 sec |
+| 2 | Attiva trusted access | Console > CloudFormation > StackSets | 1 min |
+| 3 | Crea StackSet | `aws cloudformation create-stack-set ...` | 10 sec |
+| 4 | Deploya ruolo | `aws cloudformation create-stack-instances ...` | 2-5 min |
+| 5 | **Lancia script** | `python find_ses_account.py "MSG-ID" ...` | **1-2 min** |
+| 6 | Rimuovi istanze | `aws cloudformation delete-stack-instances ...` | 2-5 min |
+| 7 | Cancella StackSet | `aws cloudformation delete-stack-set ...` | 10 sec |
