@@ -1,16 +1,201 @@
 #!/usr/bin/env python3
 """
-Trova l'account AWS che ha inviato un'email SES dato il Message-ID.
+find_ses_account.py - Trova l'account AWS che ha inviato un'email tramite SES.
 
-Il Message-ID SES contiene la regione (es: xxx@eu-west-1.amazonses.com).
-Lo script assume il ruolo in ogni account dell'org e cerca in CloudTrail
-il match sul messageId nel responseElements degli eventi SendEmail.
+================================================================================
+COSA FA
+================================================================================
 
-Uso:
-    python find_ses_account.py "0100abc123-xxxx-xxxx@eu-west-1.amazonses.com"
-    python find_ses_account.py "0100abc123-xxxx-xxxx@eu-west-1.amazonses.com" --profile prod
-    python find_ses_account.py "0100abc123-xxxx-xxxx@eu-west-1.amazonses.com" --role-name AdminRole
-    python find_ses_account.py "0100abc123-xxxx-xxxx@eu-west-1.amazonses.com" --days 30
+Dato il Message-ID di un'email inviata tramite Amazon SES, identifica quale
+account AWS dell'organizzazione l'ha inviata. Lo fa cercando in CloudTrail
+di ogni account il campo responseElements.messageId degli eventi SendEmail.
+
+Il Message-ID SES ha questo formato:
+    <0100018f1a2b3c4d-abcdef01-2345-6789-abcd-ef0123456789-000000@eu-west-1.amazonses.com>
+
+Da cui lo script estrae automaticamente:
+    - Regione SES: eu-west-1 (dalla parte dopo la @)
+    - SES Message-ID: 0100018f1a2b3c4d-abcdef01-... (la parte prima della @)
+
+================================================================================
+DOVE TROVARE IL MESSAGE-ID
+================================================================================
+
+Il Message-ID si trova negli header dell'email ricevuta. Per visualizzarli:
+
+    Gmail:
+        Apri l'email > menu (3 puntini) > "Mostra originale"
+        Cerca la riga "Message-ID:" oppure "X-SES-Outgoing"
+
+    Outlook:
+        Apri l'email > File > Proprieta > "Intestazioni Internet"
+
+    Thunderbird:
+        Apri l'email > Visualizza > Sorgente del messaggio (Ctrl+U)
+
+    Apple Mail:
+        Apri l'email > Visualizza > Messaggio > Sorgente completa
+
+    Header da cercare (in ordine di preferenza):
+        Message-ID: <xxx@eu-west-1.amazonses.com>    <-- questo!
+        X-SES-MESSAGE-ID: 0100018f1a2b3c4d-xxx        <-- anche questo va bene
+
+================================================================================
+PREREQUISITI
+================================================================================
+
+1. Python 3.7+
+
+2. Installare boto3:
+       pip install boto3
+
+3. Credenziali AWS del MASTER ACCOUNT (management account) dell'organizzazione.
+   Configurale con uno di questi metodi:
+       - aws configure                       (credenziali nel profilo default)
+       - aws configure --profile mio-master  (profilo dedicato, poi usa --profile)
+       - Variabili d'ambiente AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+       - IAM role su EC2/Lambda (automatico)
+
+4. Un ruolo IAM assumibile in ogni account membro. Di default lo script usa
+   "OrganizationAccountAccessRole" che AWS crea automaticamente quando aggiungi
+   un account all'organizzazione. Se usi un ruolo diverso, passa --role-name.
+
+5. Il ruolo deve avere almeno queste permission:
+       - cloudtrail:LookupEvents
+       - sts:AssumeRole (sul master account)
+       - organizations:ListAccounts (sul master account)
+
+================================================================================
+USO
+================================================================================
+
+    Uso base (passa il Message-ID completo con la regione):
+
+        python find_ses_account.py "0100018f-xxxx@eu-west-1.amazonses.com"
+
+    Con profilo AWS specifico:
+
+        python find_ses_account.py "0100018f-xxxx@eu-west-1.amazonses.com" --profile prod-master
+
+    Con ruolo custom:
+
+        python find_ses_account.py "0100018f-xxxx@eu-west-1.amazonses.com" --role-name AdminAccessRole
+
+    Cercare piu' indietro nel tempo (default 14 giorni, max 90):
+
+        python find_ses_account.py "0100018f-xxxx@eu-west-1.amazonses.com" --days 30
+
+    Cercare solo in account specifici (se sai gia' i candidati):
+
+        python find_ses_account.py "0100018f-xxxx@eu-west-1.amazonses.com" --account-ids 111122223333,444455556666
+
+    Aumentare il parallelismo (default 10 thread):
+
+        python find_ses_account.py "0100018f-xxxx@eu-west-1.amazonses.com" --threads 20
+
+================================================================================
+PARAMETRI
+================================================================================
+
+    message_id              (obbligatorio) Il Message-ID dell'email SES.
+                            Accetta sia il formato completo con < > sia senza.
+
+    --role-name, -r         Nome del ruolo da assumere negli account.
+                            Default: OrganizationAccountAccessRole
+
+    --profile, -p           Nome del profilo AWS CLI da usare.
+
+    --days, -d              Quanti giorni indietro cercare in CloudTrail.
+                            Default: 14. Max: 90 (limite CloudTrail).
+
+    --threads, -t           Numero di thread per la ricerca parallela.
+                            Default: 10.
+
+    --account-ids           Lista di account ID separati da virgola.
+                            Se specificato, cerca solo in questi account
+                            invece che in tutta l'organizzazione.
+
+================================================================================
+COME FUNZIONA
+================================================================================
+
+    1. Parsing del Message-ID
+       Estrae la regione SES (es: eu-west-1) e l'ID del messaggio.
+
+    2. Lista account
+       Chiama organizations:ListAccounts per ottenere tutti gli account attivi
+       dell'organizzazione (oppure usa --account-ids).
+
+    3. Ricerca parallela
+       Per ogni account, in parallelo:
+       - Assume il ruolo nell'account (sts:AssumeRole)
+       - Chiama cloudtrail:LookupEvents nella regione estratta
+       - Cerca eventi SendEmail/SendRawEmail/SendBulkEmail/SendTemplatedEmail
+       - Confronta responseElements.messageId con il Message-ID cercato
+
+    4. Primo match = stop
+       Appena trova il match si ferma e stampa tutti i dettagli:
+       Account ID, nome, caller ARN, timestamp, from, to, subject, IP, ecc.
+
+================================================================================
+OUTPUT DI ESEMPIO
+================================================================================
+
+    $ python find_ses_account.py "0100018f-xxxx@eu-west-1.amazonses.com"
+
+      SES Message-ID: 0100018f-xxxx
+      Regione:        eu-west-1
+      Master Account: 000000000000
+      Account da cercare: 15
+      Ultimi 14 giorni
+
+      Ricerca in corso...
+
+      [ ] Account-Dev (111111111111)
+      [ ] Account-Staging (222222222222)
+      [*] Account-Prod (333333333333) - *** TROVATO ***
+
+    ======================================================================
+      TROVATO!
+    ======================================================================
+      Account ID:    333333333333
+      Account Name:  Account-Prod
+      Regione:       eu-west-1
+      Evento:        SendEmail
+      Timestamp:     2024-01-15 10:30:45+00:00
+      Message-ID:    0100018f-xxxx
+      From:          noreply@example.com
+      To:            destinatario@gmail.com
+      Subject:       Conferma ordine #12345
+      Source IP:     10.0.1.50
+      Caller ARN:    arn:aws:iam::333333333333:role/MyAppRole
+      Caller Type:   AssumedRole
+      User Agent:    aws-sdk-python/1.26.0
+    ======================================================================
+
+================================================================================
+TROUBLESHOOTING
+================================================================================
+
+    "NON TROVATO"
+        - L'email e' stata inviata piu' di --days giorni fa? Prova --days 90
+        - Il Message-ID e' corretto? Deve contenere @region.amazonses.com
+        - CloudTrail potrebbe non essere attivo in tutti gli account
+        - Il ruolo potrebbe non esistere in alcuni account
+
+    "Regione non trovata nel Message-ID"
+        - Il Message-ID deve contenere @region.amazonses.com
+        - Se hai solo l'X-SES-MESSAGE-ID (senza @), aggiungi la regione:
+          "0100018f-xxxx@eu-west-1.amazonses.com"
+
+    "skip (no role access)"
+        - Il ruolo non esiste in quell'account, o non hai permesso di assumerlo
+        - Verifica con: aws sts assume-role --role-arn arn:aws:iam::ACCOUNT:role/RUOLO
+
+    Lo script e' lento
+        - Aumenta i thread: --threads 20
+        - Riduci i giorni: --days 7
+        - Specifica gli account candidati: --account-ids 111,222,333
 """
 
 import argparse
